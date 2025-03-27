@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+import gymnasium as gym
+import os
+import jax
+import jax.numpy as jnp
+import haiku as hk
+import optax
+import wandb
+import numpy as np
+import typing as tt
+import dataclasses
+from datetime import timedelta, datetime
+
+SEED = 123
+
+
+@dataclasses.dataclass
+class Hyperparams:
+    env_name: str
+    stop_reward: float
+    run_name: str
+    replay_size: int
+    replay_initial: int
+    target_net_sync: int
+    epsilon_frames: int
+    learning_rate: float = 0.0001
+    batch_size: int = 32
+    gamma: float = 0.99  # ensure this is a float
+    epsilon_start: float = 1.0
+    epsilon_final: float = 0.1
+    episodes_to_solve: int = 500
+
+
+GAME_PARAMS = {
+    "pong": Hyperparams(
+        env_name="PongNoFrameskip-v4",
+        stop_reward=18.0,
+        run_name="pong",
+        replay_size=100_000,
+        replay_initial=10_000,
+        target_net_sync=1000,
+        epsilon_frames=100_000,
+        epsilon_final=0.02,
+    )
+}
+
+
+class DQNNetwork(hk.Module):
+    def __init__(self, n_actions, name=None):
+        super().__init__(name=name)
+        self.n_actions = n_actions
+
+    def __call__(self, x):
+        x = x.astype(jnp.float32) / 255.0
+        conv_layers = hk.Sequential(
+            [
+                hk.Conv2D(32, kernel_shape=8, stride=4),
+                jax.nn.relu,
+                hk.Conv2D(64, kernel_shape=4, stride=2),
+                jax.nn.relu,
+                hk.Conv2D(64, kernel_shape=3, stride=1),
+                jax.nn.relu,
+                hk.Flatten(),
+            ]
+        )
+
+        conv_out = conv_layers(x)
+        fc_layers = hk.Sequential(
+            [hk.Linear(512), jax.nn.relu, hk.Linear(self.n_actions)]
+        )
+
+        return fc_layers(conv_out)
+
+
+class EpsilonTracker:
+    def __init__(self, params: Hyperparams):
+        self.params = params
+
+    def get_epsilon(self, frame_idx: int) -> float:
+        eps = self.params.epsilon_start - frame_idx / self.params.epsilon_frames
+        return max(self.params.epsilon_final, eps)
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, state, action, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, done)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        batch = np.random.choice(len(self.buffer), batch_size, replace=False)
+        return [self.buffer[idx] for idx in batch]
+
+
+def create_dqn_network(obs_shape, n_actions):
+    def network(x):
+        model = DQNNetwork(n_actions)
+        return model(x)
+
+    return hk.without_apply_rng(hk.transform(network))
+
+
+def loss_fn(params, target_params, network, target_network, batch, gamma):
+    states, actions, rewards, next_states, dones = batch
+
+    q_values = network.apply(params, states)
+    next_q_values = target_network.apply(target_params, next_states)
+
+    # Double DQN style target calculation
+    next_actions = jnp.argmax(q_values, axis=1)
+    next_q_value = next_q_values[jnp.arange(next_q_values.shape[0]), next_actions]
+
+    targets = rewards + gamma * next_q_value * (1.0 - dones)
+    selected_q_values = q_values[jnp.arange(q_values.shape[0]), actions]
+
+    return jnp.mean(optax.huber_loss(selected_q_values, targets))
+
+
+def train(params: Hyperparams) -> tt.Optional[int]:
+    # Initialize wandb
+    wandb.init(project="jax-dqn", config=dataclasses.asdict(params))
+
+    # Set up environment
+    env = gym.make(params.env_name)
+    env.reset(seed=SEED)
+
+    # Initialize random key
+    key = jax.random.PRNGKey(SEED)
+
+    # Create network and target network
+    network = create_dqn_network(env.observation_space.shape, env.action_space.n)
+    key, subkey = jax.random.split(key)
+    initial_params = network.init(
+        subkey, jnp.zeros((1, *env.observation_space.shape), dtype=jnp.float32)
+    )
+    target_params = initial_params
+
+    # Optimizer
+    optimizer = optax.adam(params.learning_rate)
+    opt_state = optimizer.init(initial_params)
+
+    # Epsilon tracker
+    epsilon_tracker = EpsilonTracker(params)
+
+    # Replay buffer
+    replay_buffer = ReplayBuffer(params.replay_size)
+
+    # Training loop
+    total_frames = 0
+    episodes_completed = 0
+
+    @jax.jit
+    def update_step(params, target_params, opt_state, batch, gamma):
+        grad_fn = jax.value_and_grad(loss_fn, argnums=0)
+        loss, grads = grad_fn(params, target_params, network, network, batch, gamma)
+        updates, new_opt_state = optimizer.update(grads, opt_state)
+        new_params = optax.apply_updates(params, updates)
+        return loss, new_params, new_opt_state
+
+    while episodes_completed < params.episodes_to_solve:
+        state, _ = env.reset()
+        done = False
+        episode_reward = 0
+
+        while not done:
+            epsilon = epsilon_tracker.get_epsilon(total_frames)
+            if np.random.random() < epsilon:
+                action = env.action_space.sample()
+            else:
+                q_vals = network.apply(initial_params, state[None])
+                action = int(jnp.argmax(q_vals))
+
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+
+            replay_buffer.push(state, action, reward, next_state, float(done))
+            state = next_state
+            episode_reward += reward
+            total_frames += 1
+
+            # Update network
+            if len(replay_buffer.buffer) >= params.replay_initial:
+                batch = replay_buffer.sample(params.batch_size)
+                batch = [jnp.array(x) for x in zip(*batch)]
+
+                loss, initial_params, opt_state = update_step(
+                    initial_params, target_params, opt_state, batch, params.gamma
+                )
+
+                # Soft target network update
+                if total_frames % params.target_net_sync == 0:
+                    target_params = initial_params
+
+                wandb.log(
+                    {
+                        "loss": float(loss),
+                        "epsilon": epsilon,
+                        "episode_reward": episode_reward,
+                    }
+                )
+
+            if done:
+                episodes_completed += 1
+                print(f"Episode {episodes_completed}: Reward = {episode_reward}")
+
+                if episode_reward >= params.stop_reward:
+                    wandb.finish()
+                    return episodes_completed
+
+    wandb.finish()
+    return None
+
+
+def setup_jax_gpu():
+    # Ensure JAX sees the GPU
+    print("JAX visible devices:", jax.devices())
+
+    # Optionally, set CUDA memory allocation strategy
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
+
+def main():
+    setup_jax_gpu()
+    params = GAME_PARAMS["pong"]
+    train(params)
+
+
+if __name__ == "__main__":
+    main()
