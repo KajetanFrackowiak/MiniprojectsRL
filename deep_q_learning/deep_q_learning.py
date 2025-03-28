@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import gymnasium as gym
+import ale_py
 import os
 import jax
 import jax.numpy as jnp
@@ -9,6 +10,7 @@ import wandb
 import numpy as np
 import typing as tt
 import dataclasses
+import pickle
 from datetime import timedelta, datetime
 
 SEED = 123
@@ -122,8 +124,40 @@ def loss_fn(params, target_params, network, target_network, batch, gamma):
     return jnp.mean(optax.huber_loss(selected_q_values, targets))
 
 
+def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple]:
+    if not os.path.exists(checkpoint_dir):
+        return None
+
+    checkpoint_files = [
+        f
+        for f in os.listdir(checkpoint_dir)
+        if f.startswith("checkpoint_" and f.endswith(".pkl"))
+    ]
+    if not checkpoint_dir:
+        return None
+
+    latest_checkpoint = max(
+        checkpoint_files, key=lambda x: int(x.split("_")[1].split(".")[0])
+    )
+    checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
+
+    with open(checkpoint_path, "rb") as f:
+        checkpoint_data = pickle.load(f)
+
+    return (
+        checkpoint_data["params"],
+        checkpoint_data["opt_state"],
+        checkpoint_data["replay_buffer"],
+        checkpoint_data["position"],
+        checkpoint_data["episodes"],
+        checkpoint_data["frames"],
+    )
+
+
 def train(params: Hyperparams) -> tt.Optional[int]:
-    # Initialize wandb
+    # Google Drive is already mounted manually in Colab
+
+    # Initialize WandB logging
     wandb.init(project="jax-dqn", config=dataclasses.asdict(params))
 
     # Set up environment
@@ -136,9 +170,24 @@ def train(params: Hyperparams) -> tt.Optional[int]:
     # Create network and target network
     network = create_dqn_network(env.observation_space.shape, env.action_space.n)
     key, subkey = jax.random.split(key)
-    initial_params = network.init(
-        subkey, jnp.zeros((1, *env.observation_space.shape), dtype=jnp.float32)
-    )
+
+    # Checkpoint directory
+    checkpoint_dir = "/content/drive/MyDrive/dqn_checkpoints"
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+
+    # Try to load existing checkpoint
+    checkpoint_data = load_latest_checkpoint(checkpoint_dir)
+    if checkpoint_data is not None:
+        initial_params, total_frames = checkpoint_data
+        print(f"Loaded checkpoint from frame {total_frames}")
+    else:
+        initial_params = network.init(
+            subkey, jnp.zeros((1, *env.observation_space.shape), dtype=jnp.float32)
+        )
+        total_frames = 0
+        print("No checkpoint found, starting from scratch")
+
     target_params = initial_params
 
     # Optimizer
@@ -152,7 +201,6 @@ def train(params: Hyperparams) -> tt.Optional[int]:
     replay_buffer = ReplayBuffer(params.replay_size)
 
     # Training loop
-    total_frames = 0
     episodes_completed = 0
 
     @jax.jit
@@ -205,15 +253,21 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                     }
                 )
 
+            # Save checkpoint at regular intervals
+            if total_frames % 50_000 == 0:
+                checkpoint_path = f"{checkpoint_dir}/checkpoint_{total_frames}.pkl"
+                with open(checkpoint_path, "wb") as f:
+                    pickle.dump(initial_params, f)
+                print(f"Checkpoint saved at frame {total_frames}")
+
             if done:
                 episodes_completed += 1
                 print(f"Episode {episodes_completed}: Reward = {episode_reward}")
 
                 if episode_reward >= params.stop_reward:
-                    wandb.finish()
+                    print(f"Environment solved in {episodes_completed} episodes!")
                     return episodes_completed
 
-    wandb.finish()
     return None
 
 
