@@ -124,36 +124,39 @@ def loss_fn(params, target_params, network, target_network, batch, gamma):
     return jnp.mean(optax.huber_loss(selected_q_values, targets))
 
 
-def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple]:
+def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple[tt.Dict, int, int, list]]:
+    """Load the latest checkpoint if it exists."""
     if not os.path.exists(checkpoint_dir):
+        print(f"Directory {checkpoint_dir} does not exist.")
         return None
 
     checkpoint_files = [
-        f
-        for f in os.listdir(checkpoint_dir)
-        if f.startswith("checkpoint_" and f.endswith(".pkl"))
+        f for f in os.listdir(checkpoint_dir) if f.startswith("checkpoint_") and f.endswith(".pkl")
     ]
-    if not checkpoint_dir:
+
+    if not checkpoint_files:
+        print("No checkpoint files found.")
         return None
 
-    latest_checkpoint = max(
-        checkpoint_files, key=lambda x: int(x.split("_")[1].split(".")[0])
-    )
+    latest_checkpoint = max(checkpoint_files, key=lambda x: int(x.split("_")[1].split(".")[0]))
     checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
+
+    print(f"Loading checkpoint: {checkpoint_path}")
 
     with open(checkpoint_path, "rb") as f:
         checkpoint_data = pickle.load(f)
 
-    return (
-        checkpoint_data["params"],
-        checkpoint_data["opt_state"],
-        checkpoint_data["replay_buffer"],
-        checkpoint_data["position"],
-        checkpoint_data["episodes"],
-        checkpoint_data["frames"],
-    )
+    print(f"Loaded checkpoint keys: {list(checkpoint_data.keys())}")
 
+    if isinstance(checkpoint_data, dict):
+        if "params" in checkpoint_data and "total_frames" in checkpoint_data and "episodes_completed" in checkpoint_data and "episode_rewards" in checkpoint_data:
+            return checkpoint_data["params"], checkpoint_data["total_frames"], checkpoint_data["episodes_completed"], checkpoint_data["episode_rewards"]
+        else:
+            print("Checkpoint missing some data.")
+            return None
 
+    print("Unexpected checkpoint format.")
+    return None
 def train(params: Hyperparams) -> tt.Optional[int]:
     # Google Drive is already mounted manually in Colab
 
@@ -179,13 +182,15 @@ def train(params: Hyperparams) -> tt.Optional[int]:
     # Try to load existing checkpoint
     checkpoint_data = load_latest_checkpoint(checkpoint_dir)
     if checkpoint_data is not None:
-        initial_params, total_frames = checkpoint_data
-        print(f"Loaded checkpoint from frame {total_frames}")
+        initial_params, total_frames, episodes_completed, episode_rewards = checkpoint_data  # Load model parameters and rewards
+        print(f"Loaded checkpoint with {len(initial_params)} layers.")
     else:
         initial_params = network.init(
             subkey, jnp.zeros((1, *env.observation_space.shape), dtype=jnp.float32)
         )
         total_frames = 0
+        episodes_completed = 0
+        episode_rewards = []  # Initialize empty rewards list
         print("No checkpoint found, starting from scratch")
 
     target_params = initial_params
@@ -201,8 +206,6 @@ def train(params: Hyperparams) -> tt.Optional[int]:
     replay_buffer = ReplayBuffer(params.replay_size)
 
     # Training loop
-    episodes_completed = 0
-
     @jax.jit
     def update_step(params, target_params, opt_state, batch, gamma):
         grad_fn = jax.value_and_grad(loss_fn, argnums=0)
@@ -256,11 +259,19 @@ def train(params: Hyperparams) -> tt.Optional[int]:
             # Save checkpoint at regular intervals
             if total_frames % 50_000 == 0:
                 checkpoint_path = f"{checkpoint_dir}/checkpoint_{total_frames}.pkl"
+                checkpoint_data = {
+                    "params": initial_params,
+                    "total_frames": total_frames,
+                    "episodes_completed": episodes_completed,
+                    "episode_rewards": episode_rewards,  # Save episode rewards
+                }
                 with open(checkpoint_path, "wb") as f:
-                    pickle.dump(initial_params, f)
-                print(f"Checkpoint saved at frame {total_frames}")
+                    pickle.dump(checkpoint_data, f)
+                print(f"Checkpoint {checkpoint_path} saved at frame {total_frames}")
 
             if done:
+                # Save the episode reward after the episode ends
+                episode_rewards.append(episode_reward)
                 episodes_completed += 1
                 print(f"Episode {episodes_completed}: Reward = {episode_reward}")
 
