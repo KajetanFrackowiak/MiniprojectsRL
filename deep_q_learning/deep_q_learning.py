@@ -15,7 +15,6 @@ from datetime import timedelta, datetime
 
 SEED = 123
 
-
 @dataclasses.dataclass
 class Hyperparams:
     env_name: str
@@ -27,11 +26,10 @@ class Hyperparams:
     epsilon_frames: int
     learning_rate: float = 0.0001
     batch_size: int = 32
-    gamma: float = 0.99  # ensure this is a float
+    gamma: float = 0.99
     epsilon_start: float = 1.0
     epsilon_final: float = 0.1
     episodes_to_solve: int = 500
-
 
 GAME_PARAMS = {
     "pong": Hyperparams(
@@ -45,7 +43,6 @@ GAME_PARAMS = {
         epsilon_final=0.02,
     )
 }
-
 
 class DQNNetwork(hk.Module):
     def __init__(self, n_actions, name=None):
@@ -73,7 +70,6 @@ class DQNNetwork(hk.Module):
 
         return fc_layers(conv_out)
 
-
 class EpsilonTracker:
     def __init__(self, params: Hyperparams):
         self.params = params
@@ -81,7 +77,6 @@ class EpsilonTracker:
     def get_epsilon(self, frame_idx: int) -> float:
         eps = self.params.epsilon_start - frame_idx / self.params.epsilon_frames
         return max(self.params.epsilon_final, eps)
-
 
 class ReplayBuffer:
     def __init__(self, capacity: int):
@@ -99,7 +94,6 @@ class ReplayBuffer:
         batch = np.random.choice(len(self.buffer), batch_size, replace=False)
         return [self.buffer[idx] for idx in batch]
 
-
 def create_dqn_network(obs_shape, n_actions):
     def network(x):
         model = DQNNetwork(n_actions)
@@ -107,24 +101,25 @@ def create_dqn_network(obs_shape, n_actions):
 
     return hk.without_apply_rng(hk.transform(network))
 
-
 def loss_fn(params, target_params, network, target_network, batch, gamma):
     states, actions, rewards, next_states, dones = batch
 
     q_values = network.apply(params, states)
     next_q_values = target_network.apply(target_params, next_states)
 
-    # Double DQN style target calculation
-    next_actions = jnp.argmax(q_values, axis=1)
-    next_q_value = next_q_values[jnp.arange(next_q_values.shape[0]), next_actions]
+    # Pure DQN: Select max action value from target network
+    next_q_value = jnp.max(next_q_values, axis=1)
 
+    # Compute Bellman targets
     targets = rewards + gamma * next_q_value * (1.0 - dones)
+
+    # Get Q-values for chosen actions
     selected_q_values = q_values[jnp.arange(q_values.shape[0]), actions]
 
+    # Compute loss
     return jnp.mean(optax.huber_loss(selected_q_values, targets))
 
-
-def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple[tt.Dict, int, int, list]]:
+def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple[tt.Dict, int, int, list, str]]:
     """Load the latest checkpoint if it exists."""
     if not os.path.exists(checkpoint_dir):
         print(f"Directory {checkpoint_dir} does not exist.")
@@ -150,18 +145,23 @@ def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple[tt.Dict,
 
     if isinstance(checkpoint_data, dict):
         if "params" in checkpoint_data and "total_frames" in checkpoint_data and "episodes_completed" in checkpoint_data and "episode_rewards" in checkpoint_data:
-            return checkpoint_data["params"], checkpoint_data["total_frames"], checkpoint_data["episodes_completed"], checkpoint_data["episode_rewards"]
+            # Extract the required fields
+            params = checkpoint_data["params"]
+            total_frames = checkpoint_data["total_frames"]
+            episodes_completed = checkpoint_data["episodes_completed"]
+            episode_rewards = checkpoint_data["episode_rewards"]
+            # Check for run_id, provide a default if missing (for old checkpoints)
+            run_id = checkpoint_data.get("run_id", f"pure_dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            return params, total_frames, episodes_completed, episode_rewards, run_id
         else:
             print("Checkpoint missing some data.")
             return None
 
     print("Unexpected checkpoint format.")
     return None
+
 def train(params: Hyperparams) -> tt.Optional[int]:
     # Google Drive is already mounted manually in Colab
-
-    # Initialize WandB logging
-    wandb.init(project="jax-dqn", config=dataclasses.asdict(params))
 
     # Set up environment
     env = gym.make(params.env_name)
@@ -182,16 +182,22 @@ def train(params: Hyperparams) -> tt.Optional[int]:
     # Try to load existing checkpoint
     checkpoint_data = load_latest_checkpoint(checkpoint_dir)
     if checkpoint_data is not None:
-        initial_params, total_frames, episodes_completed, episode_rewards = checkpoint_data  # Load model parameters and rewards
+        initial_params, total_frames, episodes_completed, episode_rewards, run_id = checkpoint_data
         print(f"Loaded checkpoint with {len(initial_params)} layers.")
+        print(f"Resuming W&B run with run_id: {run_id}")
     else:
         initial_params = network.init(
             subkey, jnp.zeros((1, *env.observation_space.shape), dtype=jnp.float32)
         )
         total_frames = 0
         episodes_completed = 0
-        episode_rewards = []  # Initialize empty rewards list
+        episode_rewards = []
+        # Generate a new run_id if starting from scratch
+        run_id = f"pure_dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         print("No checkpoint found, starting from scratch")
+
+    # Initialize WandB logging, resuming the run if run_id exists
+    wandb.init(project="jax-dqn", name="Pure DQN", id=run_id, resume="allow", config=dataclasses.asdict(params))
 
     target_params = initial_params
 
@@ -248,12 +254,14 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                 if total_frames % params.target_net_sync == 0:
                     target_params = initial_params
 
+                # Log per-frame metrics with total_frames as the step
                 wandb.log(
                     {
                         "loss": float(loss),
                         "epsilon": epsilon,
-                        "episode_reward": episode_reward,
-                    }
+                        "total_frames": total_frames
+                    },
+                    step=total_frames
                 )
 
             # Save checkpoint at regular intervals
@@ -263,14 +271,22 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                     "params": initial_params,
                     "total_frames": total_frames,
                     "episodes_completed": episodes_completed,
-                    "episode_rewards": episode_rewards,  # Save episode rewards
+                    "episode_rewards": episode_rewards,
+                    "run_id": run_id  # Save the run_id
                 }
                 with open(checkpoint_path, "wb") as f:
                     pickle.dump(checkpoint_data, f)
                 print(f"Checkpoint {checkpoint_path} saved at frame {total_frames}")
 
             if done:
-                # Save the episode reward after the episode ends
+                # Log episode_reward at the end of the episode
+                wandb.log(
+                    {
+                        "episode_reward": episode_reward
+                    },
+                    step=total_frames
+                )
+
                 episode_rewards.append(episode_reward)
                 episodes_completed += 1
                 print(f"Episode {episodes_completed}: Reward = {episode_reward}")
@@ -281,7 +297,6 @@ def train(params: Hyperparams) -> tt.Optional[int]:
 
     return None
 
-
 def setup_jax_gpu():
     # Ensure JAX sees the GPU
     print("JAX visible devices:", jax.devices())
@@ -290,12 +305,10 @@ def setup_jax_gpu():
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
-
 def main():
     setup_jax_gpu()
     params = GAME_PARAMS["pong"]
     train(params)
-
 
 if __name__ == "__main__":
     main()
