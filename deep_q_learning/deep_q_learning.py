@@ -257,7 +257,7 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                 )
 
             # Save checkpoint at regular intervals
-            if total_frames % 50_000 == 0:
+            if total_frames % 25_000 == 0:
                 checkpoint_path = f"{checkpoint_dir}/checkpoint_{total_frames}.pkl"
                 checkpoint_data = {
                     "params": initial_params,
