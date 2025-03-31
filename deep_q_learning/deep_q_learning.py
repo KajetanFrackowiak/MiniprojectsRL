@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import gymnasium as gym
+from gymnasium.wrappers import GrayscaleObservation, ResizeObservation, FrameStackObservation
 import ale_py
 import os
 import jax
@@ -160,6 +161,13 @@ def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple[tt.Dict,
     print("Unexpected checkpoint format.")
     return None
 
+def make_env(env_name):
+    env = gym.make(env_name)
+    env = GrayscaleObservation(env)  # Convert to grayscale
+    env = ResizeObservation(env, (84, 84))  # Resize to 84x84
+    env = FrameStackObservation(env, 4)  # Stack 4 frames
+    return env
+
 def train(params: Hyperparams) -> tt.Optional[int]:
     # Google Drive is already mounted manually in Colab
 
@@ -171,7 +179,7 @@ def train(params: Hyperparams) -> tt.Optional[int]:
     key = jax.random.PRNGKey(SEED)
 
     # Create network and target network
-    network = create_dqn_network(env.observation_space.shape, env.action_space.n)
+    network = create_dqn_network((84, 84, 4), env.action_space.n)
     key, subkey = jax.random.split(key)
 
     # Checkpoint directory
@@ -224,6 +232,7 @@ def train(params: Hyperparams) -> tt.Optional[int]:
         state, _ = env.reset()
         done = False
         episode_reward = 0
+        episode_steps = 0
 
         while not done:
             epsilon = epsilon_tracker.get_epsilon(total_frames)
@@ -240,6 +249,7 @@ def train(params: Hyperparams) -> tt.Optional[int]:
             state = next_state
             episode_reward += reward
             total_frames += 1
+            episode_steps += 1
 
             # Update network
             if len(replay_buffer.buffer) >= params.replay_initial:
@@ -265,7 +275,7 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                 )
 
             # Save checkpoint at regular intervals
-            if total_frames % 25_000 == 0:
+            if total_frames % 10_000 == 0:
                 checkpoint_path = f"{checkpoint_dir}/checkpoint_{total_frames}.pkl"
                 checkpoint_data = {
                     "params": initial_params,
@@ -282,14 +292,15 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                 # Log episode_reward at the end of the episode
                 wandb.log(
                     {
-                        "episode_reward": episode_reward
+                        "episode_reward": episode_reward,
+                        "episode_steps": episode_steps
                     },
                     step=total_frames
                 )
 
                 episode_rewards.append(episode_reward)
                 episodes_completed += 1
-                print(f"Episode {episodes_completed}: Reward = {episode_reward}")
+                print(f"Episode {episodes_completed}: Reward = {episode_reward}, Steps: {episode_steps}")
 
                 if episode_reward >= params.stop_reward:
                     print(f"Environment solved in {episodes_completed} episodes!")
