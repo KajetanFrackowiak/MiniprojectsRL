@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 import gymnasium as gym
-from gymnasium.wrappers import GrayscaleObservation, ResizeObservation, FrameStackObservation
-import ale_py
-import os
+from gymnasium.wrappers import GrayscaleObservation, ResizeObservation, FrameStack
+import numpy as np
 import jax
 import jax.numpy as jnp
 import haiku as hk
 import optax
 import wandb
-import numpy as np
 import typing as tt
 import dataclasses
 import pickle
-from datetime import timedelta, datetime
+import os
+from datetime import datetime
 
 SEED = 123
 
@@ -25,26 +24,31 @@ class Hyperparams:
     replay_initial: int
     target_net_sync: int
     epsilon_frames: int
-    learning_rate: float = 0.0001
+    update_freq: int  # How often to perform a learning update
+    frame_skip: int   # Number of frames to skip (action repeat)
+    learning_rate: float = 0.00025
     batch_size: int = 32
     gamma: float = 0.99
     epsilon_start: float = 1.0
     epsilon_final: float = 0.1
     episodes_to_solve: int = 500
 
+# DeepMind DQN paper parameters
 GAME_PARAMS = {
     "pong": Hyperparams(
         env_name="PongNoFrameskip-v4",
         stop_reward=18.0,
         run_name="pong",
-        replay_size=100_000,
-        replay_initial=10_000,
-        target_net_sync=10_000, 
-        epsilon_frames=1_000_000,
-        epsilon_final=0.02,
-        learning_rate=9.932831968547505e-05, 
-        gamma=0.98,
-        episodes_to_solve=340, 
+        replay_size=1_000_000,      # 1M capacity as in the paper
+        replay_initial=50_000,      # 50K initial exploration frames
+        target_net_sync=10_000,     # Update target every 10K frames
+        epsilon_frames=1_000_000,   # Linear annealing over 1M frames
+        update_freq=4,              # Update network every 4 frames
+        frame_skip=4,               # Action repeat 4 times
+        learning_rate=0.00025,      # RMSProp with 0.00025 learning rate
+        gamma=0.99,
+        episodes_to_solve=500,
+        epsilon_final=0.1,          # Final exploration rate 0.1
     )
 }
 
@@ -54,33 +58,33 @@ class DQNNetwork(hk.Module):
         self.n_actions = n_actions
 
     def __call__(self, x):
+        # Normalize between 0 and 1 (as in DeepMind paper)
         x = x.astype(jnp.float32) / 255.0
-        conv_layers = hk.Sequential(
-            [
-                hk.Conv2D(32, kernel_shape=8, stride=4),
-                jax.nn.relu,
-                hk.Conv2D(64, kernel_shape=4, stride=2),
-                jax.nn.relu,
-                hk.Conv2D(64, kernel_shape=3, stride=1),
-                jax.nn.relu,
-                hk.Flatten(),
-            ]
-        )
-
-        conv_out = conv_layers(x)
-        fc_layers = hk.Sequential(
-            [hk.Linear(512), jax.nn.relu, hk.Linear(self.n_actions)]
-        )
-
-        return fc_layers(conv_out)
+        
+        # Architecture from the Nature paper
+        x = hk.Conv2D(32, kernel_shape=8, stride=4, padding="VALID")(x)
+        x = jax.nn.relu(x)
+        x = hk.Conv2D(64, kernel_shape=4, stride=2, padding="VALID")(x)
+        x = jax.nn.relu(x)
+        x = hk.Conv2D(64, kernel_shape=3, stride=1, padding="VALID")(x)
+        x = jax.nn.relu(x)
+        x = hk.Flatten()(x)
+        x = hk.Linear(512)(x)
+        x = jax.nn.relu(x)
+        x = hk.Linear(self.n_actions)(x)
+        return x
 
 class EpsilonTracker:
     def __init__(self, params: Hyperparams):
         self.params = params
+        self.epsilon_slope = (self.params.epsilon_final - self.params.epsilon_start) / self.params.epsilon_frames
 
     def get_epsilon(self, frame_idx: int) -> float:
-        eps = self.params.epsilon_start - frame_idx / self.params.epsilon_frames
-        return max(self.params.epsilon_final, eps)
+        # Linear annealing
+        if frame_idx < self.params.epsilon_frames:
+            return self.params.epsilon_start + frame_idx * self.epsilon_slope
+        else:
+            return self.params.epsilon_final
 
 class ReplayBuffer:
     def __init__(self, capacity: int):
@@ -97,6 +101,9 @@ class ReplayBuffer:
     def sample(self, batch_size):
         batch = np.random.choice(len(self.buffer), batch_size, replace=False)
         return [self.buffer[idx] for idx in batch]
+
+    def __len__(self):
+        return len(self.buffer)
 
 def create_dqn_network(obs_shape, n_actions):
     def network(x):
@@ -120,19 +127,23 @@ def loss_fn(params, target_params, network, target_network, batch, gamma):
     # Compute Q-values for the next states using the target network
     next_q_values = target_network.apply(target_params, next_states)
 
-    # Pure DQN: Select max action value from target network
+    # Select max action value from target network (DQN approach)
     next_q_value = jnp.max(next_q_values, axis=1)
 
-    # Compute Bellman targets (equivalent to PyTorch's next_state_vals[done_mask] = 0.0)
+    # Compute Bellman targets
     targets = rewards + gamma * next_q_value * (1.0 - dones)
 
     # Select Q-values for the chosen actions
     batch_indices = jnp.arange(q_values.shape[0])
     selected_q_values = q_values[batch_indices, actions]
 
-    loss = jnp.mean((selected_q_values - targets) ** 2)
-
-    return loss
+    # Huber loss as used in the DeepMind paper
+    delta = 1.0
+    abs_diff = jnp.abs(selected_q_values - targets)
+    quadratic = jnp.minimum(abs_diff, delta)
+    linear = abs_diff - quadratic
+    loss = 0.5 * quadratic**2 + delta * linear
+    return jnp.mean(loss)
 
 def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple[tt.Dict, int, int, list, str]]:
     if not os.path.exists(checkpoint_dir):
@@ -155,61 +166,82 @@ def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple[tt.Dict,
     with open(checkpoint_path, "rb") as f:
         checkpoint_data = pickle.load(f)
 
-    print(f"Loaded checkpoint keys: {list(checkpoint_data.keys())}")
-
     if isinstance(checkpoint_data, dict):
         if "params" in checkpoint_data and "total_frames" in checkpoint_data and "episodes_completed" in checkpoint_data and "episode_rewards" in checkpoint_data:
             params = checkpoint_data["params"]
             total_frames = checkpoint_data["total_frames"]
             episodes_completed = checkpoint_data["episodes_completed"]
             episode_rewards = checkpoint_data["episode_rewards"]
-            run_id = checkpoint_data.get("run_id", f"pure_dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            run_id = checkpoint_data.get("run_id", f"dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
             return params, total_frames, episodes_completed, episode_rewards, run_id
-        else:
-            print("Checkpoint missing some data.")
-            return None
-
-    print("Unexpected checkpoint format.")
+    
+    print("Invalid checkpoint format.")
     return None
 
-def make_env(env_name):
-    env = gym.make(env_name)
-    env = GrayscaleObservation(env)
-    env = ResizeObservation(env, (84, 84))
-    env = FrameStackObservation(env, 4)
+# Custom wrapper for reward clipping
+class ClipRewardEnv(gym.RewardWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+    
+    def reward(self, reward):
+        """Clips rewards to {-1, 0, +1} as per the DeepMind paper"""
+        return np.sign(reward)
+
+def make_env(env_name, frame_skip=4):
+    """Create Atari environment with proper preprocessing as in the DQN paper"""
+    env = gym.make(env_name, render_mode=None)
+    
+    # Skip the "NoFrameskip" part when applying AtariPreprocessing
+    # since we explicitly set frame_skip
+    env = ClipRewardEnv(env)  # Reward clipping
+    env = GrayscaleObservation(env, keep_dim=False)  # Convert to grayscale
+    env = ResizeObservation(env, (84, 84))  # Resize to 84x84
+    env = FrameStack(env, 4)  # Stack 4 frames
     return env
 
 def train(params: Hyperparams) -> tt.Optional[int]:
-    env = gym.make(params.env_name)
+    env = make_env(params.env_name, params.frame_skip)
     env.reset(seed=SEED)
-
+    
     key = jax.random.PRNGKey(SEED)
-    network = create_dqn_network((84, 84, 4), env.action_space.n)
+    network = create_dqn_network((4, 84, 84), env.action_space.n)
     key, subkey = jax.random.split(key)
 
-    checkpoint_dir = "/content/drive/MyDrive/dqn_checkpoints"
+    checkpoint_dir = "./dqn_checkpoints"
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
     checkpoint_data = load_latest_checkpoint(checkpoint_dir)
     if checkpoint_data is not None:
         initial_params, total_frames, episodes_completed, episode_rewards, run_id = checkpoint_data
-        print(f"Loaded checkpoint with {len(initial_params)} layers.")
+        print(f"Loaded checkpoint with {total_frames} frames completed")
         print(f"Resuming W&B run with run_id: {run_id}")
     else:
-        initial_params = network.init(
-            subkey, jnp.zeros((1, *env.observation_space.shape), dtype=jnp.float32)
-        )
+        # Initialize parameters with correct input shape (batch, channels, height, width)
+        dummy_input = jnp.zeros((1, 4, 84, 84), dtype=jnp.float32)
+        initial_params = network.init(subkey, dummy_input)
         total_frames = 0
         episodes_completed = 0
         episode_rewards = []
-        run_id = f"pure_dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_id = f"dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         print("No checkpoint found, starting from scratch")
 
-    wandb.init(project="jax-dqn", name="Pure DQN", id=run_id, resume="allow", config=dataclasses.asdict(params))
+    wandb.init(
+        project="jax-dqn", 
+        name="DQN-Nature", 
+        id=run_id, 
+        resume="allow",
+        config=dataclasses.asdict(params)
+    )
 
     target_params = initial_params
-    optimizer = optax.adam(params.learning_rate)
+    # RMSProp optimizer as used in the Nature paper with proper hyperparameters
+    optimizer = optax.rmsprop(
+        learning_rate=params.learning_rate,
+        decay=0.95,
+        eps=0.01,
+        initial_scale=1.0
+    )
     opt_state = optimizer.init(initial_params)
 
     epsilon_tracker = EpsilonTracker(params)
@@ -223,6 +255,9 @@ def train(params: Hyperparams) -> tt.Optional[int]:
         new_params = optax.apply_updates(params, updates)
         return loss, new_params, new_opt_state
 
+    frames_since_last_update = 0
+    best_mean_reward = float('-inf')
+    
     while episodes_completed < params.episodes_to_solve:
         state, _ = env.reset()
         done = False
@@ -230,23 +265,32 @@ def train(params: Hyperparams) -> tt.Optional[int]:
         episode_steps = 0
 
         while not done:
+            # Convert state from (frames, height, width) to (frames, height, width)
+            # JAX expects channel-first format
+            state_array = np.array(state)
+            
             epsilon = epsilon_tracker.get_epsilon(total_frames)
             if np.random.random() < epsilon:
                 action = env.action_space.sample()
             else:
-                q_vals = network.apply(initial_params, state[None])
-                action = int(jnp.argmax(q_vals))
+                # Add batch dimension
+                state_input = state_array[None, ...]
+                q_vals = network.apply(initial_params, state_input)
+                action = int(jnp.argmax(q_vals[0]))
 
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
 
-            replay_buffer.push(state, action, reward, next_state, float(done))
+            replay_buffer.push(state_array, action, reward, np.array(next_state), float(done))
             state = next_state
             episode_reward += reward
             total_frames += 1
             episode_steps += 1
+            frames_since_last_update += 1
 
-            if len(replay_buffer.buffer) >= params.replay_initial:
+            # Only update the network every update_freq frames (4 in the paper)
+            if frames_since_last_update >= params.update_freq and len(replay_buffer) >= params.replay_initial:
+                frames_since_last_update = 0
                 batch = replay_buffer.sample(params.batch_size)
                 batch = [jnp.array(x) for x in zip(*batch)]
 
@@ -254,8 +298,10 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                     initial_params, target_params, opt_state, batch, params.gamma
                 )
 
+                # Update target network at regular intervals
                 if total_frames % params.target_net_sync == 0:
                     target_params = initial_params
+                    print(f"Updated target network at frame {total_frames}")
 
                 wandb.log(
                     {
@@ -266,7 +312,8 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                     step=total_frames
                 )
 
-            if total_frames % 10_000 == 0:
+            # Checkpoint saving logic
+            if total_frames % 100_000 == 0:
                 checkpoint_path = f"{checkpoint_dir}/checkpoint_{total_frames}.pkl"
                 checkpoint_data = {
                     "params": initial_params,
@@ -277,27 +324,39 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                 }
                 with open(checkpoint_path, "wb") as f:
                     pickle.dump(checkpoint_data, f)
-                print(f"Checkpoint {checkpoint_path} saved at frame {total_frames}")
+                print(f"Checkpoint saved at frame {total_frames}")
+                
+                # Calculate mean reward over last 100 episodes
+                if len(episode_rewards) > 100:
+                    mean_reward = np.mean(episode_rewards[-100:])
+                    if mean_reward > best_mean_reward:
+                        best_mean_reward = mean_reward
+                        best_model_path = f"{checkpoint_dir}/best_model.pkl"
+                        with open(best_model_path, "wb") as f:
+                            pickle.dump(checkpoint_data, f)
+                        print(f"New best model with mean reward: {mean_reward:.2f}")
 
             if done:
                 wandb.log(
                     {
                         "episode_reward": episode_reward,
-                        "episode_steps": episode_steps
+                        "episode_steps": episode_steps,
+                        "episode": episodes_completed
                     },
                     step=total_frames
                 )
 
                 episode_rewards.append(episode_reward)
                 episodes_completed += 1
-                print(f"Episode {episodes_completed}: Reward = {episode_reward}, Steps: {episode_steps}")
-
-                if episodes_completed % 100 == 0:
-                    env.render()
-
-                if episode_reward >= params.stop_reward:
-                    print(f"Environment solved in {episodes_completed} episodes!")
-                    return episodes_completed
+                print(f"Episode {episodes_completed}: Reward = {episode_reward}, Steps: {episode_steps}, Frames: {total_frames}")
+                
+                # Calculate running average
+                if len(episode_rewards) > 100:
+                    avg_reward = np.mean(episode_rewards[-100:])
+                    print(f"Last 100 episodes average reward: {avg_reward:.2f}")
+                    if avg_reward >= params.stop_reward:
+                        print(f"Environment solved with average reward {avg_reward:.2f} over 100 episodes!")
+                        return episodes_completed
 
     return None
 
