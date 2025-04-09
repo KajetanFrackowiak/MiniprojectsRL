@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import gymnasium as gym
-from gymnasium.wrappers import GrayscaleObservation, ResizeObservation, FrameStack
+import ale_py
+from gymnasium.wrappers import GrayscaleObservation, ResizeObservation, FrameStackObservation
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -196,7 +197,7 @@ def make_env(env_name, frame_skip=4):
     env = ClipRewardEnv(env)  # Reward clipping
     env = GrayscaleObservation(env, keep_dim=False)  # Convert to grayscale
     env = ResizeObservation(env, (84, 84))  # Resize to 84x84
-    env = FrameStack(env, 4)  # Stack 4 frames
+    env = FrameStackObservation(env, 4)  # Stack 4 frames
     return env
 
 def train(params: Hyperparams) -> tt.Optional[int]:
