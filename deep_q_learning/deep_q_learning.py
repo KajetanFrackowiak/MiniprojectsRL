@@ -314,7 +314,7 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                 )
 
             # Checkpoint saving logic
-            if total_frames % 100_000 == 0:
+            if total_frames % 10_000 == 0:
                 checkpoint_path = f"{checkpoint_dir}/checkpoint_{total_frames}.pkl"
                 checkpoint_data = {
                     "params": initial_params,
