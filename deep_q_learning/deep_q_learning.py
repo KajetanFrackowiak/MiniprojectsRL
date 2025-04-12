@@ -208,7 +208,7 @@ def train(params: Hyperparams) -> tt.Optional[int]:
     network = create_dqn_network((4, 84, 84), env.action_space.n)
     key, subkey = jax.random.split(key)
 
-    checkpoint_dir = "./dqn_checkpoints"
+    checkpoint_dir = "/content/drive/MyDrive/dqn_checkpoints"
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
