@@ -168,13 +168,14 @@ def load_latest_checkpoint(checkpoint_dir: str) -> tt.Optional[tt.Tuple[tt.Dict,
         checkpoint_data = pickle.load(f)
 
     if isinstance(checkpoint_data, dict):
-        if "params" in checkpoint_data and "total_frames" in checkpoint_data and "episodes_completed" in checkpoint_data and "episode_rewards" in checkpoint_data:
+        if "params" in checkpoint_data and "opt_state" in checkpoint_data and "total_frames" in checkpoint_data and "episodes_completed" in checkpoint_data and "episode_rewards" in checkpoint_data:
             params = checkpoint_data["params"]
+            opt_state = checkpoint_data["opt_state"]
             total_frames = checkpoint_data["total_frames"]
             episodes_completed = checkpoint_data["episodes_completed"]
             episode_rewards = checkpoint_data["episode_rewards"]
             run_id = checkpoint_data.get("run_id", f"dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-            return params, total_frames, episodes_completed, episode_rewards, run_id
+            return params, opt_state, total_frames, episodes_completed, episode_rewards, run_id
     
     print("Invalid checkpoint format.")
     return None
@@ -208,13 +209,21 @@ def train(params: Hyperparams) -> tt.Optional[int]:
     network = create_dqn_network((4, 84, 84), env.action_space.n)
     key, subkey = jax.random.split(key)
 
+    # RMSProp optimizer as used in the Nature paper with proper hyperparameters
+    optimizer = optax.rmsprop(
+        learning_rate=params.learning_rate,
+        decay=0.95,
+        eps=0.01,
+        initial_scale=1.0
+    )
+
     checkpoint_dir = "/content/drive/MyDrive/dqn_checkpoints"
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
     checkpoint_data = load_latest_checkpoint(checkpoint_dir)
     if checkpoint_data is not None:
-        initial_params, total_frames, episodes_completed, episode_rewards, run_id = checkpoint_data
+        initial_params, opt_state, total_frames, episodes_completed, episode_rewards, run_id = checkpoint_data
         print(f"Loaded checkpoint with {total_frames} frames completed")
         print(f"Resuming W&B run with run_id: {run_id}")
     else:
@@ -236,13 +245,7 @@ def train(params: Hyperparams) -> tt.Optional[int]:
     )
 
     target_params = initial_params
-    # RMSProp optimizer as used in the Nature paper with proper hyperparameters
-    optimizer = optax.rmsprop(
-        learning_rate=params.learning_rate,
-        decay=0.95,
-        eps=0.01,
-        initial_scale=1.0
-    )
+    
     opt_state = optimizer.init(initial_params)
 
     epsilon_tracker = EpsilonTracker(params)
@@ -318,6 +321,7 @@ def train(params: Hyperparams) -> tt.Optional[int]:
                 checkpoint_path = f"{checkpoint_dir}/checkpoint_{total_frames}.pkl"
                 checkpoint_data = {
                     "params": initial_params,
+                    "opt_state": opt_state,
                     "total_frames": total_frames,
                     "episodes_completed": episodes_completed,
                     "episode_rewards": episode_rewards,
